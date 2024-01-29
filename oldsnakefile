@@ -1,0 +1,1034 @@
+import os
+import pandas as pd
+from pathlib import Path
+# configfile: "conf/private/configPrivate.yaml"
+configfile: "conf/shared/configShared.yaml"
+pepfile: "conf/private/project_config.yaml"
+samples = pep.sample_table.sample_name
+peptable = pep.sample_table
+import csv
+peptable.to_csv("conf/private/peptable.csv", index = False, quoting=csv.QUOTE_NONNUMERIC)
+
+#shell.executable('/gpfs/runtime/opt/zsh/5.8.1/bin/zsh')
+
+paths = [
+    "envs",
+    "report",
+    "qc",
+    "scripts",
+    "qc/{sample}",
+    "rawdata/{sample}",
+    "logs/{sample}",
+    "intermediates/{sample}/methylation",
+    "intermediates/{sample}/dorado",
+    "intermediates/{sample}/fastqs",
+    "intermediates/{sample}/alignments",
+    "results/{sample}",
+    "results/plots",
+    "results/tables"
+    ]
+paths = paths + []
+for path in paths:
+    for sample in samples:
+        os.makedirs(path.format(sample=sample), exist_ok = True)
+
+
+
+rule all:
+    input:
+        [
+             "rawdata5/CALLS.bam"
+            ]
+# "results/tables/dmls.tsv",
+#             expand("intermediates/{sample}/methylation/{sample}_bedMethyl.bed", sample = samples),
+#             expand("intermediates/{sample}/alignments/{sample}.filtered.bam.bai", sample = samples),
+#             expand("qc/{sample}/{sample}pycoQC.html", sample = samples),
+
+rule dorado:
+    input:
+        dir = "rawdata5/"
+    output:
+        calls = "rawdata5/CALLS.bam"
+    resources:
+        cpus_per_task =8,
+        threads = 8,
+        runtime = 5760,
+        slurm_partition="gpu-he",
+        mem_mb = 128000,
+        slurm_extra="--time=96:00:00 --constraint=a6000 --gres=gpu:2 --mail-type=ALL --mail-user=maxfield_kelsey@brown.edu"
+    shell:
+        """
+/users/mkelsey/data/tools/dorado-0.4.1-linux-x64/bin/dorado \
+basecaller \
+/users/mkelsey/data/tools/dorado-0.4.1-linux-x64/models/dna_r10.4.1_e8.2_400bps_hac@v4.2.0 \
+{input.dir} \
+--recursive \
+--verbose \
+--reference /gpfs/data/jsedivy/mkelsey/ref/genomes/hs1/hs1.sorted.fa.mmi \
+--modified-bases 5mCG_5hmCG > {output.calls}
+        """
+
+rule filterbam:
+    input:
+        bam = "intermediates/{sample}/alignments/{sample}.sorted.bam"
+    output:
+        bam = "intermediates/{sample}/alignments/{sample}.filtered.bam"
+    resources:
+        cpus_per_task =6,
+        mem_mb = 40000
+    conda:
+        "omics"
+    log: "logs/{sample}_filterbam.log"
+    shell: "samtools view -b -F 0x100 -q 10 -e '[qs] > 10' {input.bam} > {output.bam} 2> {log}"
+
+rule sortbam:
+    input:
+        bam = "intermediates/{sample}/alignments/{sample}.bam"
+    output:
+        sortedbam = "intermediates/{sample}/alignments/{sample}.sorted.bam"
+    resources:
+        cpus_per_task =10,
+        mem_mb = 128000
+    conda:
+        "omics"
+    log: "logs/{sample}_sortbam.log"
+    shell: "samtools sort -@8 -m4g {input.bam} > {output.sortedbam} 2> {log}"
+    
+rule indexbam:
+    input:
+        sortedbam = "intermediates/{sample}/alignments/{bamname}.bam"
+    output:
+        bai = "intermediates/{sample}/alignments/{bamname}.bam.bai"
+    resources:
+        cpus_per_task =10,
+        mem_mb = 128000
+    conda:
+        "minimap2"
+    log: "logs/{sample}_{bamname}indexbam.log"
+    shell: "samtools index  -@6 {input.sortedbam} 2> {log}"
+
+rule bamstats:
+    input:
+        sortedbam = "intermediates/{sample}/alignments/{sample}.sorted.bam",
+        bai = "intermediates/{sample}/alignments/{sample}.sorted.bam.bai"
+    output:
+        "qc/{sample}/{sample}.bamstats.txt"
+    conda:
+        "omics"
+    shell:
+        """
+samtools stats {input.sortedbam} > {output}
+        """
+
+rule mergeBams:
+    input:
+        expand("intermediates/{sample}/alignments/{sample}.sorted.bam", sample = samples)
+    output:
+        mergedbam = "intermediates/merged.sorted.bam"
+    conda:
+        "minimap2"
+    resources:
+        cpus_per_task =8,
+        mem_mb = 128000,
+        slurm_extra="--time=2:00:00 --constraint=cascade"
+    log: "logs/mergeBams.log"
+    shell: "samtools merge --threads 6 {output.mergedbam} {input} 2> {log}"
+    
+rule dorado_seqsummary:
+    input:
+        sortedbam = "intermediates/{sample}/alignments/{sample}.filtered.bam",
+        bai = "intermediates/{sample}/alignments/{sample}.filtered.bam.bai"
+    output:
+        "qc/{sample}/{sample}.doradosummary.txt"
+    conda:
+        "omics"
+    shell:
+        """
+/users/mkelsey/data/tools/dorado-0.3.4-linux-x64/bin/dorado summary {input.sortedbam} > {output}
+        """
+
+rule pycoQC:
+    input:
+        seqsummary = "qc/{sample}/{sample}.doradosummary.txt",
+        sortedbam = "intermediates/{sample}/alignments/{sample}.filtered.bam",
+
+    output:
+        "qc/{sample}/{sample}pycoQC.html"
+    conda:
+        "pycoQC"
+    shell:
+        """
+pycoQC --summary_file {input.seqsummary} --bam_file {input.sortedbam} --html_outfile {output} --min_pass_qual 10 --sample
+        """
+
+
+
+rule whatshap:
+    input:
+        shortreadsbam = "../../freebayes/alignment/lf1.sorted.bam",
+        shortreadsbamindex = "../../freebayes/alignment/lf1.sorted.bam.bai",
+        longreadsbam = "intermediates/{sample}/alignments/{sample}.sorted.bam",
+        longreadsbamindex = "intermediates/{sample}/alignments/{sample}.sorted.bam.bai",
+        vcf = "../../freebayes/results/variants.vcf",
+        ref = config["hs1sorted"],
+    output:
+        phasedvcf = "intermediates/{sample}/alignments/phased.vcf"
+    resources:
+        runtime = 1200
+    log:
+        "logs/whatshap{sample}.log"
+    conda:
+        "whatshap"
+    resources:
+        cpus_per_task =10
+    shell:	
+        """
+whatshap phase \
+--ignore-read-groups \
+-o {output.phasedvcf} \
+--reference={input.ref} \
+{input.vcf} \
+{input.shortreadsbam} \
+{input.longreadsbam} > {log}
+        """
+
+rule bgzipandindexphased:
+    input:
+        phasedvcf = "results/phased.vcf"
+    output:
+        phasedvcfgz = "results/phased.vcf.gz"
+    log:
+        "logs/bgzipandindexphased.log"
+    conda:
+        "omics"
+    resources:
+        cpus_per_task =10
+    shell:	
+        """
+bgzip {input.phasedvcf}
+tabix {input.phasedvcf}.gz
+        """
+        
+rule addphasetobam:
+    input:
+        sortedbam = "intermediates/{sample}/alignments/{sample}.sorted.bam",
+        bai = "intermediates/{sample}/alignments/{sample}.sorted.bam.bai",
+        phasedvcfgz = "../../freebayes/results/phased.vcf.gz",
+        ref = config["hs1sorted"]
+    log:
+        "logs/addphasetobam{sample}.log"
+    output:
+        haplotaggedbam = "intermediates/{sample}/alignments/{sample}.sorted.haplotagged.bam",
+    resources:
+        cpus_per_task = 20
+    conda:
+        "whatshap"
+    shell:
+        """
+whatshap haplotag -o {output.haplotaggedbam} --output-threads=$(( {resources.cpus_per_task}-10 )) --ignore-read-groups --reference {input.ref} {input.phasedvcfgz} {input.sortedbam} 2> {log}
+        """
+
+
+rule methylartistprepdssdata:
+    input:
+        sortedbam = "intermediates/{sample}/alignments/{sample}.filtered.bam",
+        bai = "intermediates/{sample}/alignments/{sample}.filtered.bam.bai",
+    params:
+        ref = config["hs1sorted"],
+        refindex = config["hs1sortedindex"]
+    output:
+        "intermediates/{sample}/{sample}.dss.tsv"
+    conda: "methylartist"
+    log: "logs/methylartistgetdssdata{sample}.log"
+    resources:
+        cpus_per_task = 10,
+        runtime = 1000
+    shell:
+        r"""
+/users/mkelsey/data/tools/methylartist/methylartist wgmeth -b {input.sortedbam} --dss --ref {params.ref} --fai {params.refindex} -o {output} -p {resources.cpus_per_task} --motif CG --mod m 2> {log}
+        """
+#be sure to put the input of an expand call in quotes when wanting it to show up properly in R script e.g. '{input.data}'
+#NOTE THERE are hard coded paths and sample metadata
+rule dss:
+    input:
+        data = expand("intermediates/{sample}/{sample}.dss.tsv", sample = samples),
+    output:
+        dmls = "results/tables/dmls.tsv",
+        dmrs = "results/tables/dmrs.tsv"
+    conda:
+        "dss"
+    resources:
+        cpus_per_task = 16,
+        mem_mb = 200000
+    log:
+        "logs/dss.log"
+    shell:
+        "Rscript scripts/dss.r data='{input.data}' dmlspath={output.dmls} dmrspath={output.dmrs} > {log} 2> test.err"
+        
+rule intersectDssWithRegions:
+    input:
+        dmrs = "results/tables/dmrs.tsv"
+    params:
+        ref = config["hs1sorted"],
+        intactl1s = config["intactl1hss"],
+        repeatsannotated = config["repeatsannotated"]
+    output:
+        intactl1s = "results/tables/dmintactl1s.bed",
+        #repeatsannotated = "results/tables/dmrepeats.bed"
+
+    conda:
+        "omics"
+    log:
+        "logs/intersectDssWithRegions"
+    shell:
+        """
+bedtools intersect -b {input.dmrs} -a {params.intactl1s} > {output.intactl1s} 2>> {log}
+        """
+
+
+
+# cat {input.dmrs} | ~/data/scripts/scientificnottoint.awk > {input.dmrs}.int.bed 2> {log}
+# cat {params.intactl1s} | ~/data/scripts/scientificnottoint.awk > {params.intactl1s}.int.bed 2>> {log}
+# cat {params.repeatsannotated} | ~/data/scripts/scientificnottoint.awk > {params.repeatsannotated}.int.bed 2>> {log}
+
+# bedtools intersect -b {input.dmrs} -a {params.repeatsannotated}.int.bed > {output.repeatsannotated} 2>> {log}
+
+# #note gotta run with snakelocal
+rule methylartistsegmeth:
+    input:
+        sortedbams = expand("intermediates/{sample}/alignments/{sample}.sorted.bam", sample=samples),
+        bai = expand("intermediates/{sample}/alignments/{sample}.sorted.bam.bai", sample = samples)
+    params:
+        windows10kb = config["hs110kwindowsbed4"],
+        ref = config["hs1sorted"],
+        intactl1hss = config["intactl1hss"],
+        l1hspid80 = config["l1hspid80"],
+        l1pa2pid80 = config["l1pa2pid80"],
+        cCREs = config["cCREs"],
+        repeatsannotated = config["repeatsannotated"],
+    resources:
+        cpus_per_task = 30
+    output:
+        "results/segmeth.tsv"
+    log:
+        "logs/methylartistsegmeth.log"
+    conda:
+        "methylartist"
+    shell:
+        r"""
+awk '/(L1HS)(.)+/ {{if ($3-$2>=6000){{print}} }}' {params.repeatsannotated} | awk 'IFS=OFS="\t" {{ if ($6 == "+") {{print $1,$2,$2+1000,"L1HS_5UTR_"$11}} else {{print $1,$3-1000,$3,"L1HS_5UTR_"$11}} }}' > bed1.bed 2> {log}
+awk '/(AluY)(.)+/ {{if ($3-$2>=280){{print}} }}' {params.repeatsannotated} | awk 'IFS=OFS="\t" {{ if ($6 == "+") {{print $1,$2,$2+300,"AluY_"$11}} else {{print $1,$3-300,$3,"AluY_"$11}} }}' > bed2.bed 2>> {log}
+awk '/(HERVK(.)*int)/ {{if ($3-$2>=7000){{print}} }}' {params.repeatsannotated} | awk 'IFS=OFS="\t" {{ if ($6 == "+") {{print $1,$2-600,$2,"HERVK_LTR_"$11}} else {{print $1,$3,$3+600,"HERVK_LTR_"$11}} }}' > bed3.bed 2>> {log}
+awk '/LINE\/L1(.)+/' {params.repeatsannotated} | awk 'IFS=OFS="\t" {{print $1,$2,$3,"L1"}}' > bed4.bed 2>> {log}
+awk '/SINE\/Alu(.)+/' {params.repeatsannotated} | awk 'IFS=OFS="\t" {{print $1,$2,$3,"Alu"}}' > bed5.bed 2>> {log}
+awk '/LTR\/ERV(.)+/' {params.repeatsannotated} | awk 'IFS=OFS="\t" {{print $1,$2,$3,"ERV"}}' > bed6.bed 2>> {log}
+cat {params.intactl1hss} | awk 'IFS=OFS="\t" {{ if ($6 == "+") {{print $1,$2,$2+1000,"intact_L1HS_5UTR_"$11}} else {{print $1,$3-1000,$3,"intact_L1HS_5UTR_"$11}} }}' > bed7.bed 2>> {log}
+cat {params.l1hspid80} | awk 'IFS=OFS="\t" {{ if ($6 == "+") {{print $1,$2,$2+1000,"L1HS_PID80_5UTR_"$11}} else {{print $1,$3-1000,$3,"L1HS_PID80_5UTR_"$11}} }}' > bed8.bed 2>> {log}
+cat {params.l1pa2pid80} | awk 'IFS=OFS="\t" {{ if ($6 == "+") {{print $1,$2,$2+1000,"L1PA2_PID80_5UTR"}} else {{print $1,$3-1000,$3,"L1PA2_PID80_5UTR"}} }}' > bed9.bed 2>> {log}
+cut -f 1,2,3,7 {params.cCREs} > cCRES.bed
+bams=$(echo {input.sortedbams}) 2>> {log}
+commabams=$(echo $bams | tr ' ' ',') 2>> {log}
+cat bed{{1..9}}.bed cCRES.bed > segmethbed1.bed 2>> {log}
+cat segmethbed1.bed | ~/data/scripts/scientificnottoint.awk > segmethbed2.bed 2>> {log}
+/users/mkelsey/data/tools/methylartist/methylartist segmeth --bams $commabams --ref {params.ref} --motif CG --primary_only -i segmethbed2.bed -p {resources.cpus_per_task} -o {output} 2>> {log}
+        """
+
+
+rule methylartistsegmethEXTRA:
+    input:
+        sortedbams = expand("intermediates/{sample}/alignments/{sample}.sorted.bam", sample=samples),
+        bai = expand("intermediates/{sample}/alignments/{sample}.sorted.bam.bai", sample = samples)
+    params:
+        windows10kb = config["hs110kwindowsbed4"],
+        ref = config["hs1sorted"],
+        intactl1hss = config["intactl1hss"],
+        l1hspid80 = config["l1hspid80"],
+        l1pa2pid80 = config["l1pa2pid80"],
+        cCREs = config["cCREs"],
+        repeatsannotated = config["repeatsannotated"],
+    resources:
+        cpus_per_task = 30
+    output:
+        "results/l1hssegmeth.tsv"
+    log:
+        "logs/methylartistsegmeth.log"
+    conda:
+        "methylartist"
+    shell:
+        r"""
+cat {params.intactl1hss} | awk 'IFS=OFS="\t" {{ if ($6 == "+") {{print $1,$2,$2+1000,"intact_L1HS_5UTR_"$11}} else {{print $1,$3-1000,$3,"intact_L1HS_5UTR_"$11}} }}' > bed7.bed 2>> {log}
+bams=$(echo {input.sortedbams}) 2>> {log}
+commabams=$(echo $bams | tr ' ' ',') 2>> {log}
+cat bed7.bed | ~/data/scripts/scientificnottoint.awk > bed7.2.bed 2>> {log}
+/users/mkelsey/data/tools/methylartist/methylartist segmeth --bams $commabams --ref {params.ref} --motif CG --primary_only -i bed7.2.bed -p {resources.cpus_per_task} -o {output} 2>> {log}
+        """
+
+rule methylartistsegmethCentromere:
+    input:
+        sortedbams = expand("intermediates/{sample}/alignments/{sample}.sorted.bam", sample=samples),
+        bai = expand("intermediates/{sample}/alignments/{sample}.sorted.bam.bai", sample = samples)
+    params:
+        windows10kb = config["hs110kwindowsbed4"],
+        ref = config["hs1sorted"],
+        centromerebed = "/oscar/data/jsedivy/mkelsey/ref/genomes/hs1/windows10kcentromereannotationsorted.bed",
+    resources:
+        cpus_per_task = 30
+    output:
+        "results/segmethCentromere.tsv"
+    log:
+        "logs/methylartistsegmeth.log"
+    conda:
+        "methylartist"
+    shell:
+        r"""
+bams=$(echo {input.sortedbams}) 2>> {log}
+commabams=$(echo $bams | tr ' ' ',') 2>> {log}
+cat {params.centromerebed} | ~/data/scripts/scientificnottoint.awk > cent.bed 2>> {log}
+/users/mkelsey/data/tools/methylartist/methylartist segmeth --bams $commabams --ref {params.ref} --motif CG --primary_only -i cent.bed -p {resources.cpus_per_task} -o {output} 2>> {log}
+        """
+
+rule segmethtsvtobed:
+    input:
+        segmeth = "results/{type}.tsv"
+    output:
+        segbed = "results/{type}.bed"
+    params:
+        peptable = "conf/private/peptable.csv"
+    log:
+        "logs/{type}tsvtobed.log"
+    conda:
+        "Rclusterprofiler"
+    script:
+        "scripts/segmethtsvtobed.R"
+
+rule segmethbedPvalAnnot:
+    input:
+        segbed = "results/{type}.bed",
+        dmrs = "results/tables/dmrs.tsv"
+    output:
+        segbedPval = "results/{type}Pval.bed"
+    log:
+        "logs/{type}bedPvalAnnot.log"
+    conda:
+        "omics"
+    shell:
+        """
+awk 'NR > 1' {input.segbed} > a.bed
+bedtools intersect -c -a a.bed -b {input.dmrs} > b.bed 2> {log}
+awk 'NR <= 1 {{print $0"\tOverlapSig"}}' {input.segbed} > {output.segbedPval}
+cat b.bed >> {output.segbedPval}
+rm a.bed
+        """
+
+rule callSegmeth:
+    input:
+        ["results/segmethCentromerePval.bed"]
+
+rule globalmethAnalysis:
+    input:
+        segbedPval = "results/segmethPval.bed",
+        intactl1hssegbedPval = "results/l1hssegmeth.Pval.bed",
+        dmrs = "results/tables/dmrs.tsv",
+        dmls = "results/tables/dmls.tsv"
+    output:
+        "outfiles/methAnalysis.txt"
+    log:
+        "logs/methanalysis.log"
+    conda:
+        "Rclusterprofiler"
+    shell:
+        """
+Rscript scripts/globalmethAnalysis.R segbedPvalpath={input.segbedPval} intactl1hssegbedPvalpath={input.intactl1hssegbedPval} dmrspath={input.dmrs} dmlspath={input.dmls} > {log} 2> {log}
+touch {output}
+        """
+
+rule bedmethylanalysis:
+    input:
+        bedmethylpaths = expand("intermediates/{sample}/methylation/{sample}_bedMethyl.bed", sample = samples),
+        dmrs = "results/tables/dmrs.tsv",
+        dmls = "results/tables/dmls.tsv"
+    output:
+        "outfiles/bedmethylanalysis.txt"
+    log:
+        "logs/bedmethylanalysis.log"
+    conda:
+        "Rclusterprofiler"
+    shell:
+        """
+Rscript scripts/bedmethylanalysis.r bedmethylpaths={input.bedmethylpaths} dmrspath={input.dmrs} dmlspath={input.dmls} > {log} 2> {log}
+touch {output}
+        """
+
+
+rule gimme:
+    input:
+        hypo = "Rintermediates/promoters_dmhyporegions.bed",
+        hyper = "Rintermediates/promoters_dmhyperregions.bed"
+    output:
+        "outfiles/gimme.txt"
+    resources:
+        cpus_per_task = 26,
+        mem_mb = 64000,
+        runtime = 300
+    log:
+        "logs/gimme.log"
+    conda:
+        "Rclusterprofiler"
+    shell:
+        """
+bedtools getfasta -fi /oscar/data/jsedivy/mkelsey/ref/genomes/hs1/hs1.sorted.fa -bed Rintermediates/promoters.bed -fo Rintermediates/promoters.fa
+bedtools getfasta -fi /oscar/data/jsedivy/mkelsey/ref/genomes/hs1/hs1.sorted.fa -bed Rintermediates/promoters_dmhyperregions.bed -fo Rintermediates/promoters_dmhyperregions.fa
+bedtools getfasta -fi /oscar/data/jsedivy/mkelsey/ref/genomes/hs1/hs1.sorted.fa -bed Rintermediates/promoters_dmhyporegions.bed -fo Rintermediates/promoters_dmhyporegions.fa
+gimme motifs results/tables/dmrs_hyper.bed results/gimme/hyper --background gc -g /oscar/data/jsedivy/mkelsey/ref/genomes/hs1/hs1.sorted.fa --known --nthreads 24 -p /oscar/data/jsedivy/mkelsey/ref/pwms/hocomoco_jasperformat.txt --size 500 --noreport
+gimme motifs results/tables/dmrs_hypo.bed results/gimme/hypo --background gc -g /oscar/data/jsedivy/mkelsey/ref/genomes/hs1/hs1.sorted.fa --known --nthreads 24 -p /oscar/data/jsedivy/mkelsey/ref/pwms/hocomoco_jasperformat.txt --size 500 --noreport
+touch {output}
+        """
+
+
+#gimme motifs Rintermediates/promoters_dmhyporegions.fa results/gimme/hypo -g /oscar/data/jsedivy/mkelsey/ref/genomes/hs1/hs1.sorted.fa --background /users/mkelsey/data/Nanopore/alz/Rintermediates/promoters.fa --known --nthreads 24 -p /oscar/data/jsedivy/mkelsey/ref/pwms/hocomoco_jasperformat.txt
+
+
+
+# rule dmrregionannot:
+#     input:
+#         segbed = "results/segmeth.bed",
+#         dmrs = "results/tables/dmrs.tsv"
+#     output:
+#         segbedPval = "results/segmethPval.bed"
+#     log:
+#         "logs/segmethbedPvalAnnot.log"
+#     conda:
+#         "omics"
+#     shell:
+#         """
+#         sort -k1,1V -k2,2n -k3,3n /users/mkelsey/data/Nanopore/20230328_maxfield_kelsey/results/tables/dmrs.tsv > /users/mkelsey/data/Nanopore/20230328_maxfield_kelsey/results/tables/dmrs.sorted.tsv
+# bedtools intersect -wao -a /users/mkelsey/data/Nanopore/20230328_maxfield_kelsey/results/tables/dmrs.sorted.tsv -b /gpfs/data/jsedivy/mkelsey/ref/genomes/hs1/annotations3/cCREs/hs1-cCREs.bed > /users/mkelsey/data/Nanopore/20230328_maxfield_kelsey/results/tables/dmrs.sorted.regionsIntersected.tsv
+# sort -k1,1 -k2,2n -k3,3n -k17,17nr /users/mkelsey/data/Nanopore/20230328_maxfield_kelsey/results/tables/dmrs.sorted.regionsIntersected.tsv > /users/mkelsey/data/Nanopore/20230328_maxfield_kelsey/results/tables/dmrs.sorted.regionsIntersected.scoreSorted.tsv
+# awk '!seen[$1, $2, $3]++' /users/mkelsey/data/Nanopore/20230328_maxfield_kelsey/results/tables/dmrs.sorted.regionsIntersected.scoreSorted.tsv > /users/mkelsey/data/Nanopore/20230328_maxfield_kelsey/results/tables/dmrs.sorted.regionsIntersected.bestScore.tsv
+
+#         """
+
+#note that the phasing seems to have been so so and so there are more than 2 haplotypes, which seems to complicate methylartist sample assignment
+# I added the if then statement to deal with any failures of the command and move forward - as smoothing sometimes fails if there aren't enough reads for instance.
+
+
+
+rule methylartistlocusplot5UTR:
+    input:
+        sortedbam = expand("intermediates/{sample}/alignments/{sample}.filtered.bam", sample = samples),
+        bai = expand("intermediates/{sample}/alignments/{sample}.filtered.bam.bai", sample = samples)
+    resources:
+        runtime = 180,
+        mem_mb = 5000
+    params:
+        ref = config["hs1sorted"],
+        genes = config["genes"],
+        l1hsintact = config["intactl1hss"],
+        outputprefix = "results/plots/methylartist/locus/testlocus_l1hsintact_"
+
+    output:
+        "outfiles/methylartistlocusplot5UTR.txt"
+    log:
+        "logs/methylartistlocusplot5UTR.log"
+    conda:
+        "methylartist"
+    shell:
+        r"""
+bams=$(echo {input.sortedbam}) 2> {log}
+commabams=$(echo $bams | tr ' ' ',') 2>> {log}
+coords=$(awk '{{ if ($6 == "+") {{print $1":"$2"-"$2+909}} else {{print $1":"$3-909"-"$3}} }}' {params.l1hsintact})
+mapfile -t coords_array <<< "$coords"
+for coord in "${{coords_array[@]}}"
+do
+coordfnsafe=$(echo $coord | sed 's/:/-/')
+if /users/mkelsey/data/tools/methylartist/methylartist locus --bams conf/private/methylartist_bam_config.txt -o {params.outputprefix}${{coordfnsafe}}.png -i $coord --ref {params.ref} --motif CG -m m --highlight_bed results/tables/dmrs.bed -g /users/mkelsey/data/ref/genomes/hs1/annotations3/RTE/l1hsintact.gff.gz  -p 1,6,1,3,4 --labelgenes >> {log} 2>> {log}; then
+echo "worked"
+else
+echo "failed"
+fi
+if /users/mkelsey/data/tools/methylartist/methylartist locus --bams conf/private/methylartist_bam_config.txt -o {params.outputprefix}${{coordfnsafe}}.png -i $coord --ref {params.ref} --motif CG -m m --highlight_bed results/tables/dmrs.bed -g /users/mkelsey/data/ref/genomes/hs1/annotations3/RTE/l1hsintact.gff.gz  -p 1,6,1,3,4 --labelgenes --svg >> {log} 2>> {log}; then
+echo "worked"
+else
+echo "failed"
+fi
+done
+touch {output}       
+        """
+
+rule methylartistlocusplotexpandedview:
+    input:
+        sortedbam = expand("intermediates/{sample}/alignments/{sample}.filtered.bam", sample = samples),
+        bai = expand("intermediates/{sample}/alignments/{sample}.filtered.bam.bai", sample = samples)
+    resources:
+        runtime = 180,
+        mem_mb = 5000
+    params:
+        ref = config["hs1sorted"],
+        genes = config["genes"],
+        l1hsintact = config["intactl1hss"],
+        outputprefix = "results/plots/methylartist/locus/testlocus_l1hsintact_"
+
+    output:
+        "outfiles/methylartistlocusplotexpandedview.txt"
+    log:
+        "logs/methylartistlocusplotexpandedview.log"
+    conda:
+        "methylartist"
+    shell:
+        r"""
+bams=$(echo {input.sortedbam}) 2> {log}
+commabams=$(echo $bams | tr ' ' ',') 2>> {log}
+coords=$(awk '{{print $1":"$2-6000"-"$3+6000}}' {params.l1hsintact})
+mapfile -t coords_array <<< "$coords"
+for coord in "${{coords_array[@]}}"
+do
+coordfnsafe=$(echo $coord | sed 's/:/-/')
+if /users/mkelsey/data/tools/methylartist/methylartist locus --bams conf/private/methylartist_bam_config.txt -o {params.outputprefix}${{coordfnsafe}}.png -i $coord --ref {params.ref} --motif CG -m m --highlight_bed results/tables/dmrs.bed -g /users/mkelsey/data/ref/genomes/hs1/annotations3/RTE/l1hsintact.gff.gz  -p 1,6,1,3,4 --labelgenes >> {log} 2>> {log}; then
+echo "worked"
+else
+echo "failed"
+fi
+if /users/mkelsey/data/tools/methylartist/methylartist locus --bams conf/private/methylartist_bam_config.txt -o {params.outputprefix}${{coordfnsafe}}.png -i $coord --ref {params.ref} --motif CG -m m --highlight_bed results/tables/dmrs.bed -g /users/mkelsey/data/ref/genomes/hs1/annotations3/RTE/l1hsintact.gff.gz  -p 1,6,1,3,4 --labelgenes --svg >> {log} 2>> {log}; then
+echo "worked"
+else
+echo "failed"
+fi
+done
+touch {output}       
+        """
+
+rule methylartistlocusplotexpandedviewltr5:
+    input:
+        sortedbam = expand("intermediates/{sample}/alignments/{sample}.sorted.bam", sample = samples),
+        bai = expand("intermediates/{sample}/alignments/{sample}.sorted.bam.bai", sample = samples)
+    resources:
+        runtime = 180,
+        mem_mb = 5000
+    params:
+        ref = config["hs1sorted"],
+        genes = config["genes"],
+        l1hsintact = config["intactl1hss"],
+        outputprefix = "results/plots/methylartist/locus/testlocus_l1hsintact_"
+
+    output:
+        "outfiles/methylartistlocusplotexpandedviewltr.txt"
+    log:
+        "logs/methylartistlocusplotexpandedview.log"
+    conda:
+        "methylartist"
+    shell:
+        r"""
+bams=$(echo {input.sortedbam}) 2> {log}
+commabams=$(echo $bams | tr ' ' ',') 2>> {log}
+coords=$(awk '{{print $1":"$2-6000"-"$3+6000}}' /oscar/data/jsedivy/mkelsey/ref/genomes/hs1/annotations3/RTE/ltr5intact.bed)
+mapfile -t coords_array <<< "$coords"
+for coord in "${{coords_array[@]}}"
+do
+coordfnsafe=$(echo $coord | sed 's/:/-/')
+if /users/mkelsey/data/tools/methylartist/methylartist locus --bams conf/private/methylartist_bam_config.txt -o {params.outputprefix}${{coordfnsafe}}.png -i $coord --ref {params.ref} --motif CG -m m --highlight_bed results/tables/dmrs.methylartistHighlight.txt -g /oscar/data/jsedivy/mkelsey/ref/genomes/hs1/annotations3/RTE/ltr5intact.gff.gz  -p 1,6,1,3,4 --labelgenes >> {log} 2>> {log}; then
+echo "worked"
+else
+echo "failed"
+fi
+done
+touch {output}       
+        """
+
+#awk script to get gff in proper format for bgzip, tabix, and methylartist (note the space at the end and the feature being transcript)
+# awk -v OFS="\t" '{print $1,"hub_3671779_hs1_hub_3671779_ncbiRefSeqCurated","transcript", $2, $3, "0.000000", $6, ".", "gene_id \"l1hsintact\"; transcript_id \"l1hsintact\"; "}' l1hsintact.bed > good.gff
+# /users/mkelsey/data/tools/methylartist/methylartist locus --bams /users/mkelsey/data/Nanopore/alz/conf/private/methylartist_bam_config.txt -o results/plots/methylartist/locus/testlocus_l1hsintact_chr1-71385136-71403481.png -i chr1:71384136-71404481 --ref /users/mkelsey/data/ref/genomes/hs1/hs1.sorted.fa --motif CG -m m --highlight_bed results/tables/dmrs.methylartistHighlight.txt -g /users/mkelsey/data/ref/genomes/hs1/annotations3/RTE/good.gff.gz -p 1,6,1,3,4
+#awk -v OFS="\t" '{print $1,"hub_3671779_hs1_hub_3671779_ncbiRefSeqCurated","transcript", $2, $3, "0.000000", $6, ".", "gene_id \""$4"\"; transcript_id \""$4"\"; "}' ltr5intact.bed > ltr5intact.gff
+rule methylartistcomposite:
+    input:
+        sortedbams = expand("intermediates/{sample}/alignments/{sample}.sorted.bam", sample = samples),
+        bai = expand("intermediates/{sample}/alignments/{sample}.sorted.bam.bai", sample = samples)
+    params:
+        ref = config["hs1sorted"],
+        genes = config["genes"],
+        intactl1hss = config["intactl1hss"],
+        l13 = config["l13"],
+        l13orfs = config["l13orfs"],
+        repeats = config["repeatsbgzip"]
+    resources:
+        runtime = 30,
+        mem_mb = 100000,
+        cpus_per_task = 30
+    output:
+       "results/plots/methylartist/composite_intactl1hs.png" 
+    log:
+        "logs/methylartistcomposited.log"
+    conda:
+        "methylartist"
+    shell:
+        r"""
+cut -f1,2,3,6 {params.intactl1hss} > tempIntactL1hs.bed
+/users/mkelsey/data/tools/methylartist/methylartist composite --bams conf/private/methylartist_bam_config.txt --meanplot_cutoff 5 -s tempIntactL1hs.bed -r {params.ref} -o {output} -t {params.l13} --mod m --primary_only -p {resources.cpus_per_task} --blocks {params.l13orfs}
+        """
+
+rule callMethylartistPlots:
+    input:
+        composite = "results/plots/methylartist/composite_intactl1hs.png",
+        locus5utr = "outfiles/methylartistlocusplot5UTR.txt",
+        locus = "outfiles/methylartistlocusplot.txt",
+        locusextended = "outfiles/methylartistlocusplotexpandedview.txt"
+
+
+# rule methylartistphased:
+#     input:
+#         sortedbam = "intermediates/{sample}/alignments/{sample}.sorted.bam",
+#         bai = "intermediates/{sample}/alignments/{sample}.sorted.bam.bai"
+#         phasedvcf = "../../freebayes/results/phased.vcf"
+#     output:
+#         "qc/{sample}/{sample}.bamstats.txt"
+#     conda:
+#         "omics"
+#     shell:
+#         """
+# samtools stats {input.sortedbam} > {output}
+#         """
+
+
+
+
+
+rule homer_find_motifs:
+    input:
+        dmrs = "results/tables/dmrs.tsv"
+    params:
+        hs1 = config["hs1sorted"],
+        outputdir = "results/homer"
+    output:
+        "homeroutfile.txt"
+    conda:
+        "omics"
+    log:
+        "logs/homer_find_motifs.log"
+    shell:
+        r"""
+awk '{{IFS=OFS="\t"}}; {{print "DMR" NR, $1, $2, $3, "+"}}' {input.dmrs} > tempbed.bed
+findMotifsGenome.pl tempbed.bed {params.hs1} {params.outputdir} -size given
+touch {output}
+        """
+
+
+
+
+
+
+
+
+
+rule multiqc:
+    conda:
+        "omics"
+    params:
+        outputdir = "qc"
+    output:
+        report = "qc/multiqc_report.html",
+    shell:
+        """
+multiqc --force --outdir {params.outputdir} --filename {output.report} --export .
+        """
+
+
+# rule methylartist_region
+
+rule callmodbamtools:
+    input:
+        expand("results/{sample}/outfile.txt", sample = samples)
+
+rule modbamtools:
+    input:
+        sortedbam = "intermediates/{sample}/alignments/{sample}.sorted.bam",
+    params:
+        refseq = config["genes"],
+        outdir = "results/{sample}"
+    output:
+        outfile = "results/{sample}/outfile.txt"        
+    conda:
+        "modbam"
+    shell:
+        """
+modbamtools plot -r chr20:58815000-58895000 \
+    --gtf {params.refseq} \
+    --out {params.outdir} \
+    --prefix {wildcards.sample} \
+    --samples {wildcards.sample} \
+    --track-titles Genes \
+    {input.sortedbam}
+touch {output.outfile}
+        """
+
+
+rule callmodbamtobedandextractmods:
+    input:
+        [expand("intermediates/{sample}/methylation/{sample}_bedMethyl.bed", sample = samples),
+        expand("intermediates/{sample}/methylation/{sample}_mods.tsv", sample = samples)]
+
+rule modbamtobed:
+    input:
+        sortedbam = "intermediates/{sample}/alignments/{sample}.filtered.bam",
+        bai = "intermediates/{sample}/alignments/{sample}.filtered.bam.bai"
+    params:
+        ref = config["hs1sorted"],
+        outdir = "results/{sample}"
+    log: "logs/{sample}modbam2bed.log"
+    resources:
+        cpus_per_task = 40,
+        mem_mb = 100000
+    output:
+        bed = "intermediates/{sample}/methylation/{sample}_bedMethyl.bed",
+    conda:
+        "omics"
+    shell: 
+        """
+/oscar/data/jsedivy/mkelsey/tools/modkit/modkit pileup {input.sortedbam} {output.bed} \
+  --ref {params.ref} \
+  --preset traditional \
+  -t {resources.cpus_per_task} \
+  2> {log}
+        """
+
+rule tldr:
+    input:
+        bam = "intermediates/{sample}/alignments/{sample}.filtered.bam"
+    output:
+        tldr = "tldr/{sample}.filtered.table.txt"
+    resources:
+        cpus_per_task = 24,
+        mem_mb = 100000,
+        runtime = 300
+    log:
+        "logs/tldr_{sample}.log"
+    conda:
+        "tldr"
+    shell:
+        """
+cd tldr
+tldr -b ../{input.bam} \
+-e /oscar/data/jsedivy/mkelsey/tools/tldr/ref/teref.ont.human.fa \
+-r /oscar/data/jsedivy/mkelsey/ref/genomes/hs1/hs1.sorted.fa \
+-p 20 \
+--detail_output \
+--extend_consensus 4000 \
+--trdcol \
+--keep_pickles \
+--methylartist
+        """
+
+
+rule modbamtobedTLDRinsertions:
+    input:
+        tldr = "tldr/{sample}.filtered.table.txt"
+    params:
+        ref = config["hs1sorted"],
+        indir = "tldr/{sample}.filtered"
+    resources:
+        cpus_per_task = 4,
+        mem_mb = 30000
+    output:
+        outfile = "outfiles/{sample}.bedmethyltldr.txt"
+    conda:
+        "omics"
+    shell: 
+        """
+bash scripts/bedmethtldr.sh {params.indir}
+touch {output.outfile}
+        """
+
+rule modbamtobedTLDRinsertionsCombinedCall:
+    input:
+        tldr = "tldr/SEN1.filtered_PRO1.filtered.table.txt"
+    params:
+        ref = config["hs1sorted"],
+        indir = "tldr/SEN1.filtered_PRO1.filtered"
+    resources:
+        cpus_per_task = 4,
+        mem_mb = 30000
+    output:
+        outfile = "outfiles/bedmethyltldrCombinedCall.txt"
+    conda:
+        "omics"
+    shell: 
+        """
+bash scripts/bedmethtldr.sh {params.indir}
+touch {output.outfile}
+        """
+
+rule extractmods:
+    input:
+        sortedbam = "intermediates/{sample}/alignments/{sample}.sorted.bam",
+    params:
+        ref = config["hs1sorted"],
+        outdir = "results/{sample}"
+    log: "logs/{sample}modbam2bed.log"
+    resources:
+        cpus_per_task = 16,
+        mem_mb = 100000
+    output:
+        bed = "intermediates/{sample}/methylation/{sample}_mods.tsv",
+    conda:
+        "omics"
+    shell: 
+        """
+/oscar/data/jsedivy/mkelsey/tools/modkit/modkit extract \
+{input.sortedbam} \
+{output.bed} \
+--region chr20 \
+--ref {params.ref} \
+-t {resources.cpus_per_task} \
+2> {log}
+        """
+
+
+
+rule deeptools_coverage:
+    input:
+        sortedbam = "intermediates/{sample}/alignments/{sample}.sorted.bam",
+    conda:
+        "deeptools"
+    output:
+        coverage = "intermediates/{sample}/alignments/coverage.bw"
+    shell: "bamCoverage -b {input.sortedbam} -o {output.coverage} --outFileFormat bigwig"
+
+rule deeptools_plotcoverage:
+    input:
+        sortedbam = "intermediates/{sample}/alignments/{sample}.sorted.bam",
+    params:
+        l1hs6kb = config["l1hs6kbbed4"],
+        intactl1hss = config["intactl1hss"],
+    conda:
+        "deeptools"
+    output:
+        genomecoverageplot = "results/{sample}/coverageGenome.png",
+        l1hscoverageplot = "results/{sample}/coverageL1HS.png",
+        l1hsintactcoverageplot = "results/{sample}/coverageL1HSintact.png"
+    shell:
+        """
+plotCoverage -b {input.sortedbam} \
+--plotFile {output.genomecoverageplot} \
+-n 1000000 \
+--plotTitle "Whole Genome Coverage" \
+--ignoreDuplicates \
+--minMappingQuality 10
+
+plotCoverage -b {input.sortedbam} \
+--BED {params.l1hs6kb} \
+--plotFile {output.l1hscoverageplot} \
+-n 1000000 \
+--plotTitle "L1HS Coverage" \
+--ignoreDuplicates \
+--minMappingQuality 10
+
+plotCoverage -b {input.sortedbam} \
+--BED {params.intactl1hss} \
+--plotFile {output.l1hsintactcoverageplot} \
+-n 1000000 \
+--plotTitle "L1HS Coverage" \
+--ignoreDuplicates \
+--minMappingQuality 10
+        """
+
+rule callCoverageAndQC:
+    input:
+        [expand("intermediates/{sample}/alignments/coverage.bw",sample =  samples),
+        expand("results/{sample}/coverageGenome.png", sample = samples),
+        expand("qc/{sample}/{sample}.bamstats.txt", sample = samples)]
+
+# #note that you have to double up the awk parentheses in snakemake
+# rule cpgmethylationatloci:
+#     input:
+#         methbgpercpg = "intermediates/methylation/11092022_LF1CAS9_hs1.methylation_frequency_percpg.sorted.bg"
+#     params:
+#         l1hs6kb = config["l1hs6kb"],
+#         hs1size = config["hs1sortedsize"]
+#     output:
+#         avMethylation = "analysis/results/avMethylation.bg",
+#         avGroupMethylation = "analysis/results/averageMethylation.txt"
+#     shell:
+#         """
+# bedtools map \
+# -a {params.l1hs6kb} \
+# -b {input.methbgpercpg} \
+# -c 4 \
+# -g {params.hs1size} \
+# -o mean > {output.avMethylation}
+
+# av=$(cut -f15 {output.avMethylation} | awk '{{s+=$1}}END{{print "ave:",s/NR}}')
+# echo $av > {output.avGroupMethylation}
+#         """
+
+
+
+#xTea
+rule primaryAlignmentBams:
+    input:
+        sortedbam = "intermediates/{sample}/alignments/{sample}.sorted.bam"
+    output:
+        primaryAlignmentBam = "intermediates/{sample}/alignments/{sample}.sorted.primary.bam"
+    conda: "omics"
+    shell:
+        "samtools view -F 0x100 -b {input.sortedbam} > {output.primaryAlignmentBam}"
+
+rule getfastqs:
+    input:
+        primaryAlignmentBam = "intermediates/{sample}/alignments/{sample}.sorted.primary.bam"
+    output:
+        fastq = "intermediates/{sample}/fastqs/{sample}.fastq"
+    conda: "omics"
+    shell:
+        "bedtools bamtofastq  -i {input.primaryAlignmentBam} -fq {output.fastq}"
+
+rule aligntohg38:
+    input:
+        fastq = "intermediates/{sample}/fastqs/{sample}.fastq",
+        ref = "/oscar/data/jsedivy/mkelsey/ref/genomes/hg38/hg38.p13.sorted.fa"
+    output:
+        hg38bams = "intermediates/{sample}/alignments/{sample}.hg38.bam"
+    resources:
+        cpus_per_task = 20
+    shell:
+        """
+minimap2 -ax map-ont -t 12 {input.ref} {input.fastq} > {output.hg38bams}
+        """
+
+rule callhg38alignment:
+    input:
+        expand("intermediates/{sample}/alignments/{sample}.hg38.bam", sample = samples)
+
+
+
+
+
+rule xtea:
+    input:
+        sortedbams = expand("intermediates/{sample}/alignments/{sample}.sorted.bam", sample=samples),
+
+    output:
+    conda:
+        "xteanew"
+    log:
+        "logs/xtea"
+    params:
+        xteapath = "/users/mkelsey/data/tools/xTea/xtea_long",
+        hs1sorted = config["hs1sorted"],
+        rmsk = "/oscar/data/jsedivy/mkelsey/tools/xTea/rep_lib_annotation/LINE/chm13/chm13_L1_larger_500_with_all_L1HS.out",
+        cns = "/oscar/data/jsedivy/mkelsey/tools/xTea/rep_lib_annotation/consensus/LINE1.fa",
+        rep = "/oscar/data/jsedivy/mkelsey/tools/xTea/rep_lib_annotation/",
+        work_folder = "./work_folder_xtea/"
+    shell:  
+        """
+{input.samples} > sample_id.txt
+{input.sortedbams} > long_read_bam_list.txt
+
+xtea_long -i sample_id.txt \
+-b long_read_bam_list.txt \
+-p {params.work_folder} \
+-o submit_jobs.sh \
+--rmsk {params.rmsk} \
+-r {params.hs1sorted} \
+--cns {parmas.cns} \
+--rep {params.rep} \
+--xtea {params.xteapath} \
+-f 5907 -y 1 -n 30 -m 100 \
+        """
