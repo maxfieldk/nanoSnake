@@ -40,8 +40,3 @@ rule dorado_demux:
 touch {output.outfile}
         """
 
-
-
-
-
-

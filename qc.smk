@@ -114,37 +114,16 @@ rule deeptools_coverage:
 rule deeptools_plotcoverage:
     input:
         sortedbam = "intermediates/{sample}/alignments/{sample}.filtered.bam",
-    params:
-        l1hs6kb = config["l1hs6kbbed4"],
-        intactl1hss = config["l1hsintact"],
     conda:
         "deeptools"
     output:
         genomecoverageplot = "results/{sample}/coverageGenome.png",
-        l1hscoverageplot = "results/{sample}/coverageL1HS.png",
-        l1hsintactcoverageplot = "results/{sample}/coverageL1HSintact.png"
     shell:
         """
 plotCoverage -b {input.sortedbam} \
 --plotFile {output.genomecoverageplot} \
 -n 1000000 \
 --plotTitle "Whole Genome Coverage" \
---ignoreDuplicates \
---minMappingQuality 10
-
-plotCoverage -b {input.sortedbam} \
---BED {params.l1hs6kb} \
---plotFile {output.l1hscoverageplot} \
--n 1000000 \
---plotTitle "L1HS Coverage" \
---ignoreDuplicates \
---minMappingQuality 10
-
-plotCoverage -b {input.sortedbam} \
---BED {params.intactl1hss} \
---plotFile {output.l1hsintactcoverageplot} \
--n 1000000 \
---plotTitle "L1HS Coverage" \
 --ignoreDuplicates \
 --minMappingQuality 10
         """

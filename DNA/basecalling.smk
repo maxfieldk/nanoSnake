@@ -1,13 +1,16 @@
-
-
 rule dorado:
     input:
-        dir = "rawdata_4khz/{sample}"
+        dir = "rawdata/{rate}/{sample}"
     output:
-        calls = "intermediates/{sample}/alignments/{sample}.bam"
+        calls = "intermediates/{sample}/alignments/{rate}/{sample}.{type}.{modifications_string}.bam"
+    wildcard_constraints:
+        sample="[0-9A-Za-z]+",
+        type = "[0-9A-Za-z]+",
+        rate = "[0-9A-Za-z]+",
+        modifications_string = "[0-9A-Za-z_-]+"
     params:
         dorado = config["dorado"],
-        basecallingModel = lambda w: config["basecallingModel"]["4khz"],
+        basecallingModel = lambda w: config["basecallingModel"][w.rate][w.type],
         reference = config["reference"]
     resources:
         cpus_per_task =12,
@@ -17,11 +20,13 @@ rule dorado:
         slurm_extra="--time=96:00:00 --constraint=a6000 --gres=gpu:2"
     shell:
         """
+mkdir -p $(dirname {output.calls})
+mod_string=$(echo {wildcards.modifications_string} | tr "-" ",")
+
 {params.dorado} \
 basecaller \
-{params.basecallingModel} \
+{wildcards.type},$mod_string \
 {input.dir} \
---modified-bases  5mCG_5hmCG \
 --recursive \
 --verbose \
 --reference {params.reference} > {output.calls}
