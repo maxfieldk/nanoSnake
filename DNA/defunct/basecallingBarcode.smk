@@ -1,4 +1,4 @@
-rule dorado:
+rule dorado_barcode:
     input:
         dir = "rawdata/"
     output:
